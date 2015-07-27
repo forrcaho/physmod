@@ -1,3 +1,9 @@
+# Emacs backup files
+*~
+
+# Executable for this project
+physmod
+
 # Object files
 *.o
 *.ko
