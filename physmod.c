@@ -1,36 +1,99 @@
+/*
+This code simulates a resonating n-dimensional space using a simplified
+physical model.
+
+The code iterates over an array representing an n-dimensional grid. At 
+each step a new value is calculated for each point by considering two factors:
+
+1) Each point continues moving in the same direction it was moving before
+   (called "momentum"). An amount is added to the value of the point equal
+   to the difference between the past two values of that point, times a 
+   coefficient c_momentum (which may need to be < 1.0 to prevent divergence).
+
+2) Each point is pulled on by its surrounding points (those whose coordinates
+   are equal to this point plus or minus 1 in each of the n dimensions).
+   The average of the difference between the surrounding points and the
+   point being evaluated is multiplied by another coefficient, c_pull.
+
+The results of each step are sampled at one or more coordinates in the grid
+and these values are written to a file for later analysis to (hopefully)
+turn into sound.
+*/
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <omp.h>
 
+
+/*
+We use a #define to specify what format of floating-point numbers we
+will use. We have to store a value for each point on our grid for two
+consecutive steps, so we will need 2 * (the product of the array sizes
+in each dimension) * (the size of a floating point number) memory space.
+Although double would be preferred for accurate calculations, a double
+is 8 bytes while a float is 4 bytes. Choose wisely.
+*/
+#define MYFLT float
+
+/*
+When considering the surrounding points of a given point, the question
+arises as to how to handle the edges. Three different possibilities,
+called "end strategies", are implemented. These are
+
+FIXED: The point just off the edge is always considered to have
+       a fixed value of zero. This is like a string which is fixed
+       at the edges.
+
+WRAPPED: The point just off the edge is the value of the opposite
+         edge, so the dimension is "wrapped around".
+
+LOOSE: The point just off the edge is not used in the calculation.
+       The average used to calculate the pull contains one less point.
+*/
 typedef enum {
   FIXED,
   WRAPPED,
   LOOSE
 } end_strategy_t;
 
+
+/*
+The main structure defining the n-dimensional space.
+*/
 typedef struct {
   int dimcount;
   int *dimsize;
-  double c_momentum, c_pull;
+  MYFLT c_momentum, c_pull;
   end_strategy_t *left_strategy, *right_strategy;
   int bufsize;
-  double *bufA, *bufB;
+  MYFLT *bufA, *bufB;
 } physmod_t;
 
 physmod_t *PHYSMOD;
 
-void randomize_buffer(double *buf, int size, double lo, double hi);
+void randomize_buffer(MYFLT *buf, int size, MYFLT lo, MYFLT hi);
+
+/*
+The number of dimensions is also in this #define, which is used for
+the dimensions of some working arrays in calc_pull_part(). This will
+have to be changed when the configuration data is read from a file,
+but for now, make sure DIMCOUNT is the same as PHYSMOD->dimcount.
+*/
 
 #define DIMCOUNT (4)
 
-/* TODO: Replace this code with something that reads values from a file. */
+/*
+Initializes the PHYSMOD data structure which defines the space.
+TODO: Replace this code with something that reads values from a file. 
+*/
 void
 init(physmod_t *p)
 {
   const int dimcount = DIMCOUNT;
   const int dimsize[] = { 5*6*7, 4*6*7, 4*5*7, 4*5*6 };
-  const double c_momentum = 0.9;
-  const double c_pull = 0.95;
+  const MYFLT c_momentum = 0.9;
+  const MYFLT c_pull = 0.95;
   const end_strategy_t left_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED, WRAPPED };
   const end_strategy_t right_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED, WRAPPED };
   int i, bufsize;
@@ -49,21 +112,21 @@ init(physmod_t *p)
   p->c_momentum = c_momentum;
   p->c_pull = c_pull;
   p->bufsize = bufsize;
-  p->bufA = calloc(bufsize, sizeof(double));
-  p->bufB = calloc(bufsize, sizeof(double));
+  p->bufA = calloc(bufsize, sizeof(MYFLT));
+  p->bufB = calloc(bufsize, sizeof(MYFLT));
   randomize_buffer(p->bufA, bufsize, -1.0, 1.0);
 }
 
-double
-random_between(double lo, double hi)
+MYFLT
+random_between(MYFLT lo, MYFLT hi)
 {
-  double rand01;
-  rand01 = (double)(random()) / (double)(RAND_MAX);
+  MYFLT rand01;
+  rand01 = (MYFLT)(random()) / (MYFLT)(RAND_MAX);
   return lo + (rand01 * (hi - lo));
 }
 
 void
-randomize_buffer(double *buf, int size, double lo, double hi)
+randomize_buffer(MYFLT *buf, int size, MYFLT lo, MYFLT hi)
 {
   int i;
   for (i=0 ; i<size ; i++) {
@@ -71,6 +134,17 @@ randomize_buffer(double *buf, int size, double lo, double hi)
   }
 }
 
+/*
+In order to accommodate an arbitrary number of dimensions, we
+implement our own translation between a one-dimensional array
+index and an n-dimensional set of coordinates. This translation
+uses the length of each array dimension as defined in the 
+PHYSMOD structure.
+
+This function takes a pointer to the PHYSMOD struct, a 
+one-dimensional index to the array, and an array to hold
+corresponding n coordinates.
+*/
 void
 extract_coords(physmod_t *p, int c, int *coords)
 {
@@ -82,6 +156,11 @@ extract_coords(physmod_t *p, int c, int *coords)
   coords[0] = c;
 }
 
+/*
+This function takes a pointer to the PHYSMOD struct and
+an n-dimensional array of coordinates and returns the
+corresponding one dimensional index.
+*/
 int
 combine_coords(physmod_t *p, int *coords)
 {
@@ -94,13 +173,17 @@ combine_coords(physmod_t *p, int *coords)
   return c;
 }
 
-double
-calc_pull_part(physmod_t *p, double *buf, int c)
+/*
+Calculates the pull part of the simulation for one-dimensional
+index c of buffer buf. 
+*/
+MYFLT
+calc_pull_part(physmod_t *p, MYFLT *buf, int c)
 {
   int i, j, adj_c, adj_value_fixed, adj_value_ignored, adj_count;
   int coords[DIMCOUNT], adj_coords[DIMCOUNT];
-  double adj_values[2*DIMCOUNT];
-  double value, pull_part;
+  MYFLT adj_values[2*DIMCOUNT];
+  MYFLT value, pull_part;
   value = buf[c];
   extract_coords(p, c, coords);
 
@@ -184,15 +267,18 @@ calc_pull_part(physmod_t *p, double *buf, int c)
 }
 
 void
-do_step(physmod_t *p, double *prev_buf, double *curr_buf)
+do_step(physmod_t *p, MYFLT *prev_buf, MYFLT *curr_buf)
 {
-  double momentum_part, pull_part;
+  MYFLT momentum_part, pull_part;
   int i;
+  
+#pragma omp parallel for private(i, momentum_part, pull_part) shared(p, prev_buf, curr_buf)
   for (i=0 ; i < p->bufsize ; i++) {
     momentum_part = (prev_buf[i] - curr_buf[i]) * p->c_momentum;
     pull_part = calc_pull_part(p, prev_buf, i);
     curr_buf[i] = prev_buf[i] + momentum_part + pull_part;
   }
+  
 }
 
 int
