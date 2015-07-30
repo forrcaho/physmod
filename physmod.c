@@ -22,6 +22,7 @@ turn into sound.
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <omp.h>
 
@@ -91,11 +92,11 @@ void
 init(physmod_t *p)
 {
   const int dimcount = DIMCOUNT;
-  const int dimsize[] = { 5*6*7, 4*6*7, 4*5*7, 4*5*6 };
+  const int dimsize[] = { 5*6*7, 4*6*7, 4*5*7, 5*6*7 };
   const MYFLT c_momentum = 0.9;
   const MYFLT c_pull = 0.95;
-  const end_strategy_t left_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED, WRAPPED };
-  const end_strategy_t right_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED, WRAPPED };
+  const end_strategy_t left_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED };
+  const end_strategy_t right_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED };
   int i, bufsize;
 
   p->dimcount = dimcount;
@@ -180,36 +181,34 @@ index c of buffer buf.
 MYFLT
 calc_pull_part(physmod_t *p, MYFLT *buf, int c)
 {
-  int i, j, adj_c, adj_value_fixed, adj_value_ignored, adj_count;
+  int i, adj_c, adj_value_fixed, adj_value_ignored, adj_count;
   int coords[DIMCOUNT], adj_coords[DIMCOUNT];
   MYFLT adj_values[2*DIMCOUNT];
   MYFLT value, pull_part;
   value = buf[c];
   extract_coords(p, c, coords);
-
   adj_count = 0;
+
   /* points to the "left" in each dimension */
   for (i=0 ; i < p->dimcount ; i++) {
     adj_value_fixed = 0;
     adj_value_ignored = 0;
-    for (j=0 ; j < p->dimcount ; j++) {
-      if (i == j) {
-	adj_coords[j] = coords[j]-1;
-	if (adj_coords[j] < 0) {
-	  switch ((p->left_strategy)[j]) {
-	  case FIXED:
-	    adj_value_fixed = 1;
-	    break;
-	  case WRAPPED:
-	    adj_coords[j] += (p->dimsize)[j];
-	    break;
-	  case LOOSE:
-	    adj_value_ignored = 1;
-	    break;
-	  }
-	}
-      } else {
-	adj_coords[j] = coords[j];
+    /* start with a copy of this point's coordinates */
+    memcpy(adj_coords, coords, p->dimcount * sizeof(int));
+    /* move dimension i one step "to the left" */
+    adj_coords[i] = coords[i]-1;
+    /* handle cases where we went off the grid */
+    if (adj_coords[i] < 0) {
+      switch ((p->left_strategy)[i]) {
+      case FIXED:
+	adj_value_fixed = 1;
+	break;
+      case WRAPPED:
+	adj_coords[i] += (p->dimsize)[i];
+	break;
+      case LOOSE:
+	adj_value_ignored = 1;
+	break;
       }
     }
     if (!adj_value_ignored) {
@@ -221,29 +220,24 @@ calc_pull_part(physmod_t *p, MYFLT *buf, int c)
       }
       adj_count++;
     }
-  }
+  }  
   /* points to the "right" in each dimension */
   for (i=0 ; i < p->dimcount ; i++) {
     adj_value_fixed = 0;
     adj_value_ignored = 0;
-    for (j=0 ; j < p->dimcount ; j++) {
-      if (i == j) {
-	adj_coords[j] = coords[j]+1;
-	if (adj_coords[j] >= (p->dimsize)[j]) {
-	  switch ((p->left_strategy)[j]) {
-	  case FIXED:
-	    adj_value_fixed = 1;
-	    break;
-	  case WRAPPED:
-	    adj_coords[j] -= (p->dimsize)[j];
-	    break;
-	  case LOOSE:
-	    adj_value_ignored = 1;
-	    break;
-	  }
-	}
-      } else {
-	adj_coords[j] = coords[j];
+    memcpy(adj_coords, coords, p->dimcount * sizeof(int));
+    adj_coords[i] = coords[i]+1;
+    if (adj_coords[i] >= (p->dimsize)[i]) {
+      switch ((p->right_strategy)[i]) {
+      case FIXED:
+	adj_value_fixed = 1;
+	break;
+      case WRAPPED:
+	adj_coords[i] -= (p->dimsize)[i];
+	break;
+      case LOOSE:
+	adj_value_ignored = 1;
+	break;
       }
     }
     if (!adj_value_ignored) {
@@ -278,7 +272,6 @@ do_step(physmod_t *p, MYFLT *prev_buf, MYFLT *curr_buf)
     pull_part = calc_pull_part(p, prev_buf, i);
     curr_buf[i] = prev_buf[i] + momentum_part + pull_part;
   }
-  
 }
 
 int
