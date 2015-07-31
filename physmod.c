@@ -69,6 +69,7 @@ typedef struct {
   end_strategy_t *left_strategy, *right_strategy;
   int bufsize;
   MYFLT *bufA, *bufB;
+  int **adj_cache;
 } physmod_t;
 
 physmod_t *PHYSMOD;
@@ -92,7 +93,7 @@ void
 init(physmod_t *p)
 {
   const int dimcount = DIMCOUNT;
-  const int dimsize[] = { 5*6*7, 4*6*7, 4*5*7, 5*6*7 };
+  const int dimsize[] = { (5*6*7)/2, (4*6*7)/2, (4*5*7)/2, (5*6*7)/2 };
   const MYFLT c_momentum = 0.9;
   const MYFLT c_pull = 0.95;
   const end_strategy_t left_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED };
@@ -115,6 +116,7 @@ init(physmod_t *p)
   p->bufsize = bufsize;
   p->bufA = calloc(bufsize, sizeof(MYFLT));
   p->bufB = calloc(bufsize, sizeof(MYFLT));
+  p->adj_cache = calloc(bufsize, sizeof(int *));
   randomize_buffer(p->bufA, bufsize, -1.0, 1.0);
 }
 
@@ -174,25 +176,36 @@ combine_coords(physmod_t *p, int *coords)
   return c;
 }
 
-/*
-Calculates the pull part of the simulation for one-dimensional
-index c of buffer buf. 
-*/
-MYFLT
-calc_pull_part(physmod_t *p, MYFLT *buf, int c)
-{
-  int i, adj_c, adj_value_fixed, adj_value_ignored, adj_count;
-  int coords[DIMCOUNT], adj_coords[DIMCOUNT];
-  MYFLT adj_values[2*DIMCOUNT];
-  MYFLT value, pull_part;
-  value = buf[c];
-  extract_coords(p, c, coords);
-  adj_count = 0;
 
+#define ADJ_IDX_FIXED (-1)
+#define ADJ_IDX_IGNORE (-2)
+
+/*
+Calculate the buffer indices of all adjacent points to
+a given buffer index c. The adjacent indices are placed in
+in the passed-in adj_idx array, which is assumed to have
+sufficent memory allocated to store 2*dimcount ints.
+
+Negative numbers indicate special treatment to handle the
+edges:
+
+ADJ_IDX_FIXED (-1)
+   Treat this point as always having the value zero
+   (FIXED end stategy)
+
+ADJ_IDX_IGNORE (-2)
+   Omit this point when calculating the average pull
+   (LOOSE end strategy)
+*/
+void
+calc_adj(physmod_t *p, int c, int *adj_idx)
+{
+  int coords[DIMCOUNT], adj_coords[DIMCOUNT];
+  int i;
+  extract_coords(p, c, coords);
   /* points to the "left" in each dimension */
   for (i=0 ; i < p->dimcount ; i++) {
-    adj_value_fixed = 0;
-    adj_value_ignored = 0;
+    adj_idx[i] = 0;
     /* start with a copy of this point's coordinates */
     memcpy(adj_coords, coords, p->dimcount * sizeof(int));
     /* move dimension i one step "to the left" */
@@ -201,65 +214,99 @@ calc_pull_part(physmod_t *p, MYFLT *buf, int c)
     if (adj_coords[i] < 0) {
       switch ((p->left_strategy)[i]) {
       case FIXED:
-	adj_value_fixed = 1;
+	adj_idx[i] = ADJ_IDX_FIXED;
 	break;
       case WRAPPED:
 	adj_coords[i] += (p->dimsize)[i];
 	break;
       case LOOSE:
-	adj_value_ignored = 1;
+	adj_idx[i] = ADJ_IDX_IGNORE;
 	break;
       }
     }
-    if (!adj_value_ignored) {
-      if (adj_value_fixed) {
-	adj_values[adj_count] = 0;
-      } else {
-	adj_c = combine_coords(p, adj_coords);
-	adj_values[adj_count] = buf[adj_c];
-      }
-      adj_count++;
+    if (adj_idx[i] == 0) {
+      adj_idx[i] = combine_coords(p, adj_coords);
     }
-  }  
+  }
   /* points to the "right" in each dimension */
   for (i=0 ; i < p->dimcount ; i++) {
-    adj_value_fixed = 0;
-    adj_value_ignored = 0;
+    adj_idx[p->dimcount + i] = 0;
     memcpy(adj_coords, coords, p->dimcount * sizeof(int));
     adj_coords[i] = coords[i]+1;
     if (adj_coords[i] >= (p->dimsize)[i]) {
       switch ((p->right_strategy)[i]) {
       case FIXED:
-	adj_value_fixed = 1;
+	adj_idx[p->dimcount + i] = ADJ_IDX_FIXED;
 	break;
       case WRAPPED:
 	adj_coords[i] -= (p->dimsize)[i];
 	break;
       case LOOSE:
-	adj_value_ignored = 1;
+	adj_idx[p->dimcount + 1] = ADJ_IDX_IGNORE;
 	break;
       }
     }
-    if (!adj_value_ignored) {
-      if (adj_value_fixed) {
-	adj_values[adj_count] = 0;
-      } else {
-	adj_c = combine_coords(p, adj_coords);
-	adj_values[adj_count] = buf[adj_c];
-      }
-      adj_count++;
+    if (adj_idx[p->dimcount + i] == 0) {
+      adj_idx[p->dimcount + i] = combine_coords(p, adj_coords);
     }
   }
+}
+
+
+/*
+Calculates the pull part of the simulation for one-dimensional
+index c of buffer buf. 
+*/
+MYFLT
+calc_pull_part(physmod_t *p, MYFLT *buf, int c)
+{
+  int *adj_idx;
+  int i, adj_count;
+  MYFLT pull_part, value, adj_value;
+  /* if adj_cache is nonzero, we assume it's initialized and should be used */
+  if (p->adj_cache) {
+    /* if the adj_cache entry for this point is zero, we need to fill it */
+    if (!p->adj_cache[c]) {
+      p->adj_cache[c] = calloc(2 * p->dimcount, sizeof(int));
+      calc_adj(p, c, p->adj_cache[c]);
+    }
+    /* use the cached values */
+    adj_idx = p->adj_cache[c];
+  } else {
+    /* cache is not in use, calculate adj values (each time) */
+    adj_idx = calloc(2 * p->dimcount, sizeof(int));
+    calc_adj(p, c, adj_idx);
+  }
   /* Now that we have all the adjacent points, calculate pull */
+  adj_count = 0;
   pull_part = 0;
-  for (i=0 ; i<adj_count ; i++) {
-    pull_part += (adj_values[i] - value); 
+  for (i=0 ; i < 2*p->dimcount ; i++) {
+    switch (adj_idx[i]) {
+    case ADJ_IDX_FIXED:
+      pull_part += (0 - buf[c]);
+      adj_count++;
+      break;
+    case ADJ_IDX_IGNORE:
+      /* do nothing */
+      break;
+    default:
+      pull_part += (buf[adj_idx[i]] - buf[c]);
+      adj_count++;
+    }
   }
   pull_part /= adj_count;
   pull_part *= p->c_pull;
   return pull_part;
 }
 
+/*
+Do one iteration of the resonance simulation.
+Note: curr_buf will hold the current step in the simulation after
+this step is complete (i.e. it is the buffer being written to).
+
+On entry, curr_buf is expected to contain the data from two steps ago,
+while prev_buf contains the data from one step ago. 
+*/
 void
 do_step(physmod_t *p, MYFLT *prev_buf, MYFLT *curr_buf)
 {
@@ -283,6 +330,8 @@ main(int argc, char **argv)
   PHYSMOD = calloc(1, sizeof(physmod_t));
   init(PHYSMOD);
 
-  do_step(PHYSMOD, PHYSMOD->bufA, PHYSMOD->bufB);
-  do_step(PHYSMOD, PHYSMOD->bufB, PHYSMOD->bufA);
+  for (i=0 ; i<100 ; i++) {
+    do_step(PHYSMOD, PHYSMOD->bufA, PHYSMOD->bufB);
+    do_step(PHYSMOD, PHYSMOD->bufB, PHYSMOD->bufA);
+  }
 }
