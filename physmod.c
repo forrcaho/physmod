@@ -24,6 +24,7 @@ turn into sound.
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <omp.h>
 
 
@@ -94,8 +95,8 @@ init(physmod_t *p)
 {
   const int dimcount = DIMCOUNT;
   const int dimsize[] = { (5*6*7)/2, (4*6*7)/2, (4*5*7)/2, (5*6*7)/2 };
-  const MYFLT c_momentum = 0.9;
-  const MYFLT c_pull = 0.95;
+  const MYFLT c_momentum = 1.0;
+  const MYFLT c_pull = 0.85;
   const end_strategy_t left_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED };
   const end_strategy_t right_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED };
   int i, bufsize;
@@ -324,14 +325,47 @@ do_step(physmod_t *p, MYFLT *prev_buf, MYFLT *curr_buf)
 int
 main(int argc, char **argv)
 {
-  int c, i;
-  int coords[5];
+  int c, i, j, tapA, tapB;
+  int tapAcoords[4], tapBcoords[4];
+  FILE *fpA, *fpB, *fpAt, *fpBt;
   srandom(time(NULL));
   PHYSMOD = calloc(1, sizeof(physmod_t));
   init(PHYSMOD);
 
-  for (i=0 ; i<100 ; i++) {
-    do_step(PHYSMOD, PHYSMOD->bufA, PHYSMOD->bufB);
-    do_step(PHYSMOD, PHYSMOD->bufB, PHYSMOD->bufA);
+  fpA = fopen("outA.dat", "wb");
+  fpB = fopen("outB.dat", "wb");
+
+  fpAt = fopen("outA.txt", "w");
+  fpBt = fopen("outB.txt", "w");
+
+ 
+  tapAcoords[0] = PHYSMOD->dimsize[0]/4;
+  tapAcoords[1] = PHYSMOD->dimsize[1]/4;
+  tapAcoords[2] = PHYSMOD->dimsize[2]/4;
+  tapAcoords[3] = PHYSMOD->dimsize[3]/4;
+  tapA = combine_coords(PHYSMOD, tapAcoords);
+  
+  tapBcoords[0] = 3*PHYSMOD->dimsize[0]/4;
+  tapBcoords[1] = 3*PHYSMOD->dimsize[1]/4;
+  tapBcoords[2] = 3*PHYSMOD->dimsize[2]/4;
+  tapBcoords[3] = 3*PHYSMOD->dimsize[3]/4;
+  tapB = combine_coords(PHYSMOD, tapBcoords);
+		       
+  for (j=0 ; j<192 ; j++) {
+    for (i=0 ; i<128 ; i++) {
+      do_step(PHYSMOD, PHYSMOD->bufA, PHYSMOD->bufB);
+      fwrite( PHYSMOD->bufA + tapA, sizeof(MYFLT), 1, fpA);
+      fprintf(fpAt, "%f\n", (PHYSMOD->bufA)[tapA]);
+      fwrite( PHYSMOD->bufA + tapB, sizeof(MYFLT), 1, fpB);
+      fprintf(fpBt, "%f\n", (PHYSMOD->bufA)[tapB]);
+      do_step(PHYSMOD, PHYSMOD->bufB, PHYSMOD->bufA);
+      fwrite( PHYSMOD->bufB + tapA, sizeof(MYFLT), 1, fpA);
+      fprintf(fpAt, "%f\n", (PHYSMOD->bufB)[tapA]);
+      fwrite( PHYSMOD->bufB + tapB, sizeof(MYFLT), 1, fpB);
+      fprintf(fpBt, "%f\n", (PHYSMOD->bufB)[tapB]);
+    }
+    sleep(20);
   }
+  fclose(fpA);
+  fclose(fpB);
 }
