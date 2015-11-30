@@ -78,29 +78,31 @@ physmod_t *PHYSMOD;
 void randomize_buffer(MYFLT *buf, int size, MYFLT lo, MYFLT hi);
 
 /*
-The number of dimensions is also in this #define, which is used for
-the dimensions of some working arrays in calc_pull_part(). This will
-have to be changed when the configuration data is read from a file,
-but for now, make sure DIMCOUNT is the same as PHYSMOD->dimcount.
-*/
-
-#define DIMCOUNT (4)
-
-/*
 Initializes the PHYSMOD data structure which defines the space.
 TODO: Replace this code with something that reads values from a file. 
 */
 void
 init(physmod_t *p)
 {
-  const int dimcount = DIMCOUNT;
+
+  const int dimcount = 1;
+  const int dimsize[] = { 512 };
+  const MYFLT c_momentum = 0.999999;
+  const MYFLT c_pull = 1.0;
+  const end_strategy_t left_strategy[] = { FIXED };
+  const end_strategy_t right_strategy[] = { FIXED };
+
+
+  /*
+  const int dimcount = 4;
   const int dimsize[] = { (5*6*7)/2, (4*6*7)/2, (4*5*7)/2, (5*6*7)/2 };
   const MYFLT c_momentum = 1.0;
-  const MYFLT c_pull = 0.85;
+  const MYFLT c_pull = 1.0 + 1e-6;
   const end_strategy_t left_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED };
   const end_strategy_t right_strategy[] = { WRAPPED, WRAPPED, WRAPPED, WRAPPED };
-  int i, bufsize;
-
+  */
+ 
+  int i, bufsize;    
   p->dimcount = dimcount;
   p->dimsize = calloc(dimcount, sizeof(int));
   p->left_strategy = calloc(dimcount, sizeof(end_strategy_t));
@@ -199,10 +201,13 @@ ADJ_IDX_IGNORE (-2)
    (LOOSE end strategy)
 */
 void
-calc_adj(physmod_t *p, int c, int *adj_idx)
+calc_adj(physmod_t *p, int c, int *adj_idx, int *scratch)
 {
-  int coords[DIMCOUNT], adj_coords[DIMCOUNT];
+  int *coords, *adj_coords;
   int i;
+
+  coords = scratch;
+  adj_coords = scratch + p->dimcount;
   extract_coords(p, c, coords);
   /* points to the "left" in each dimension */
   for (i=0 ; i < p->dimcount ; i++) {
@@ -253,30 +258,30 @@ calc_adj(physmod_t *p, int c, int *adj_idx)
   }
 }
 
-
 /*
 Calculates the pull part of the simulation for one-dimensional
 index c of buffer buf. 
 */
 MYFLT
-calc_pull_part(physmod_t *p, MYFLT *buf, int c)
+calc_pull_part(physmod_t *p, MYFLT *buf, int c, int *scratch)
 {
   int *adj_idx;
   int i, adj_count;
   MYFLT pull_part, value, adj_value;
+
   /* if adj_cache is nonzero, we assume it's initialized and should be used */
   if (p->adj_cache) {
     /* if the adj_cache entry for this point is zero, we need to fill it */
     if (!p->adj_cache[c]) {
       p->adj_cache[c] = calloc(2 * p->dimcount, sizeof(int));
-      calc_adj(p, c, p->adj_cache[c]);
+      calc_adj(p, c, p->adj_cache[c], scratch);
     }
     /* use the cached values */
     adj_idx = p->adj_cache[c];
   } else {
     /* cache is not in use, calculate adj values (each time) */
     adj_idx = calloc(2 * p->dimcount, sizeof(int));
-    calc_adj(p, c, adj_idx);
+    calc_adj(p, c, adj_idx, scratch);
   }
   /* Now that we have all the adjacent points, calculate pull */
   adj_count = 0;
@@ -309,16 +314,23 @@ On entry, curr_buf is expected to contain the data from two steps ago,
 while prev_buf contains the data from one step ago. 
 */
 void
-do_step(physmod_t *p, MYFLT *prev_buf, MYFLT *curr_buf)
+do_step(physmod_t *p, MYFLT *prev_buf, MYFLT *curr_buf, int *scratch)
 {
   MYFLT momentum_part, pull_part;
-  int i;
-  
-#pragma omp parallel for private(i, momentum_part, pull_part) shared(p, prev_buf, curr_buf)
-  for (i=0 ; i < p->bufsize ; i++) {
-    momentum_part = (prev_buf[i] - curr_buf[i]) * p->c_momentum;
-    pull_part = calc_pull_part(p, prev_buf, i);
-    curr_buf[i] = prev_buf[i] + momentum_part + pull_part;
+  int i, thread_num;
+  int *scratch_private;
+
+#pragma omp parallel shared(p, prev_buf, curr_buf, scratch) \
+  private(i, momentum_part, pull_part, thread_num, scratch_private)
+  {
+    thread_num = omp_get_thread_num();
+    scratch_private = scratch + (2 * p->dimcount) * thread_num;
+    #pragma omp for
+    for (i=0 ; i < p->bufsize ; i++) {
+      momentum_part = (prev_buf[i] - curr_buf[i]) * p->c_momentum;
+      pull_part = calc_pull_part(p, prev_buf, i, scratch_private);
+      curr_buf[i] = prev_buf[i] + momentum_part + pull_part;
+    }
   }
 }
 
@@ -326,7 +338,8 @@ int
 main(int argc, char **argv)
 {
   int c, i, j, tapA, tapB;
-  int tapAcoords[4], tapBcoords[4];
+  int *scratch;
+  int tapAcoords[1], tapBcoords[1];
   FILE *fpA, *fpB, *fpAt, *fpBt;
   srandom(time(NULL));
   PHYSMOD = calloc(1, sizeof(physmod_t));
@@ -338,33 +351,46 @@ main(int argc, char **argv)
   fpAt = fopen("outA.txt", "w");
   fpBt = fopen("outB.txt", "w");
 
- 
+
+  /* 
+     The "taps" (locations where we record the output of our
+     simulation) are the one place we still use a hardcoded
+     number of dimensions. This must be fixed.
+  */
   tapAcoords[0] = PHYSMOD->dimsize[0]/4;
+  /*
   tapAcoords[1] = PHYSMOD->dimsize[1]/4;
   tapAcoords[2] = PHYSMOD->dimsize[2]/4;
   tapAcoords[3] = PHYSMOD->dimsize[3]/4;
+  */
   tapA = combine_coords(PHYSMOD, tapAcoords);
   
   tapBcoords[0] = 3*PHYSMOD->dimsize[0]/4;
+  /*
   tapBcoords[1] = 3*PHYSMOD->dimsize[1]/4;
   tapBcoords[2] = 3*PHYSMOD->dimsize[2]/4;
   tapBcoords[3] = 3*PHYSMOD->dimsize[3]/4;
+  */
   tapB = combine_coords(PHYSMOD, tapBcoords);
-		       
-  for (j=0 ; j<192 ; j++) {
-    for (i=0 ; i<128 ; i++) {
-      do_step(PHYSMOD, PHYSMOD->bufA, PHYSMOD->bufB);
+
+  /* dynamically allocate scratch space for all threads */
+  scratch = calloc(2 * PHYSMOD->dimcount * omp_get_max_threads(), sizeof(int));
+  
+  for (j=0 ; j<64; j++) {
+    for (i=0 ; i<1024*64; i++) {
+      do_step(PHYSMOD, PHYSMOD->bufA, PHYSMOD->bufB, scratch);
       fwrite( PHYSMOD->bufA + tapA, sizeof(MYFLT), 1, fpA);
       fprintf(fpAt, "%f\n", (PHYSMOD->bufA)[tapA]);
       fwrite( PHYSMOD->bufA + tapB, sizeof(MYFLT), 1, fpB);
       fprintf(fpBt, "%f\n", (PHYSMOD->bufA)[tapB]);
-      do_step(PHYSMOD, PHYSMOD->bufB, PHYSMOD->bufA);
+      do_step(PHYSMOD, PHYSMOD->bufB, PHYSMOD->bufA, scratch);
       fwrite( PHYSMOD->bufB + tapA, sizeof(MYFLT), 1, fpA);
       fprintf(fpAt, "%f\n", (PHYSMOD->bufB)[tapA]);
       fwrite( PHYSMOD->bufB + tapB, sizeof(MYFLT), 1, fpB);
       fprintf(fpBt, "%f\n", (PHYSMOD->bufB)[tapB]);
     }
-    sleep(20);
+    fflush(NULL);
+    printf("%6d samples written\n", (j+1)*1024*64);
   }
   fclose(fpA);
   fclose(fpB);
